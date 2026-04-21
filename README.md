@@ -117,6 +117,21 @@ Watch a single episode play out step by step:
 python evaluate.py --model models/ios_ppo_gpu.zip --replay
 ```
 
+### Expert baseline
+
+Before comparing a trained model, measure the scripted expert — it replays
+`expert_solution.EXPERT_COMMANDS` through the same env and reports the same
+metrics, giving you an apples-to-apples ceiling/floor to compare against:
+
+```powershell
+python evaluate.py --expert --episodes 20
+python evaluate.py --expert --replay    # verbose step-by-step run
+```
+
+Note: the expert plan assumes lucky RNG (random teleports, maze exits,
+canyonbeast spawns). It rarely completes end-to-end, so expect a non-zero
+return and partial exploration rather than a 100% win-rate.
+
 ### Performance notes
 
 - Env stepping (the text game) is CPU-bound, so most of the speedup from

@@ -1,9 +1,11 @@
 #!/usr/bin/python3
-"""Evaluate a trained Island of Secrets PPO model.
+"""Evaluate an Island of Secrets agent (trained PPO model or hard-coded expert).
 
 Usage:
 	python evaluate.py --model models/ios_ppo --episodes 50
-	python evaluate.py --model models/ios_ppo --replay  # verbose single episode
+	python evaluate.py --model models/ios_ppo --replay   # verbose single episode
+	python evaluate.py --expert --episodes 20            # expert baseline
+	python evaluate.py --expert --replay                 # verbose expert run
 """
 
 import argparse
@@ -21,8 +23,54 @@ except ImportError as exc:
 from train_gymnasium import IOSGymEnv
 
 
+class ExpertAgent:
+	"""Scripted agent that replays the hard-coded expert trajectory.
+
+	Exposes a minimal SB3-like `predict(obs, deterministic)` interface so it
+	plugs straight into `run_episode`. Once the trajectory is exhausted, it
+	falls back to a `WAIT` no-op (or `N` if WAIT isn't available).
+	"""
+
+	def __init__(self, env: "IOSGymEnv", fallback: str = "WAIT"):
+		from expert_solution import EXPERT_COMMANDS
+
+		self.env = env
+		self.commands = list(EXPERT_COMMANDS)
+		self.cmd_to_idx = {cmd: i for i, cmd in enumerate(env.commands)}
+
+		missing = [c for c in self.commands if c not in self.cmd_to_idx]
+		if missing:
+			raise ValueError(
+				f"Expert commands missing from env action space: {missing[:5]}..."
+			)
+
+		if fallback in self.cmd_to_idx:
+			self.fallback_idx = self.cmd_to_idx[fallback]
+		elif "N" in self.cmd_to_idx:
+			self.fallback_idx = self.cmd_to_idx["N"]
+		else:
+			self.fallback_idx = 0
+
+		self.step_idx = 0
+
+	def reset(self):
+		self.step_idx = 0
+
+	def predict(self, obs, deterministic: bool = True):
+		if self.step_idx < len(self.commands):
+			cmd = self.commands[self.step_idx]
+			action = self.cmd_to_idx[cmd]
+			self.step_idx += 1
+		else:
+			action = self.fallback_idx
+		return np.array(action), None
+
+
 def run_episode(model, env, deterministic=True, render=False):
 	obs, info = env.reset()
+	if hasattr(model, "reset"):
+		model.reset()
+
 	done = False
 	truncated = False
 	total_reward = 0.0
@@ -102,15 +150,20 @@ def summarize(results):
 
 
 def main():
-	parser = argparse.ArgumentParser(description="Evaluate a trained Island of Secrets PPO model.")
-	parser.add_argument("--model", type=str, required=True, help="Path to saved model (no .zip).")
+	parser = argparse.ArgumentParser(description="Evaluate an Island of Secrets agent (PPO model or expert baseline).")
+	parser.add_argument("--model", type=str, default=None, help="Path to saved PPO model (no .zip).")
+	parser.add_argument(
+		"--expert",
+		action="store_true",
+		help="Use the hard-coded expert trajectory instead of a trained model.",
+	)
 	parser.add_argument("--episodes", type=int, default=20, help="Number of episodes to run.")
 	parser.add_argument("--max-steps", type=int, default=500, help="Max steps per episode.")
 	parser.add_argument("--seed", type=int, default=0, help="Base random seed (incremented per episode).")
 	parser.add_argument(
 		"--stochastic",
 		action="store_true",
-		help="Sample actions instead of using deterministic argmax.",
+		help="Sample actions instead of using deterministic argmax (no-op for expert).",
 	)
 	parser.add_argument(
 		"--replay",
@@ -119,15 +172,27 @@ def main():
 	)
 	args = parser.parse_args()
 
+	if not args.expert and not args.model:
+		parser.error("Either --model PATH or --expert must be provided.")
+	if args.expert and args.model:
+		parser.error("Pass either --model or --expert, not both.")
+
 	logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-	logging.info("Loading model from %s.zip", args.model)
 	env = IOSGymEnv(max_steps=args.max_steps, seed=args.seed, log_episodes=False)
-	model = PPO.load(args.model, env=env)
+
+	if args.expert:
+		logging.info("Running EXPERT baseline (scripted trajectory).")
+		agent = ExpertAgent(env)
+		agent_label = "EXPERT"
+	else:
+		logging.info("Loading model from %s.zip", args.model)
+		agent = PPO.load(args.model, env=env)
+		agent_label = f"MODEL {args.model}"
 
 	if args.replay:
-		print(f"\n== REPLAY (deterministic={not args.stochastic}) ==\n")
-		result = run_episode(model, env, deterministic=not args.stochastic, render=True)
+		print(f"\n== REPLAY [{agent_label}] (deterministic={not args.stochastic}) ==\n")
+		result = run_episode(agent, env, deterministic=not args.stochastic, render=True)
 		print(f"\nFinished: return={result['return']:.2f} steps={result['steps']} "
 			  f"won={result['won']} status={result['final_status']}")
 		return
@@ -135,7 +200,7 @@ def main():
 	results = []
 	for ep in range(args.episodes):
 		env.seed_value = args.seed + ep  # vary seed per episode
-		result = run_episode(model, env, deterministic=not args.stochastic, render=False)
+		result = run_episode(agent, env, deterministic=not args.stochastic, render=False)
 		logging.info(
 			"Episode %3d | return=%+7.2f | steps=%3d | won=%s | status=%s",
 			ep + 1, result["return"], result["steps"], result["won"], result["final_status"],
