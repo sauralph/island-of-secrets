@@ -31,6 +31,8 @@ class Game():
 		self.CONST_C2 = 21
 		self.CONST_C3 = 24
 		self.CONST_C4 = 43
+		self.debug = False
+		self.quiet = False
 
 	def __s(self):
 		return int(self.strength - (self.items_held / self.CONST_C4 + .1))
@@ -62,6 +64,11 @@ class Game():
 
 	def __slow_print(self, text):
 
+		if self.quiet:
+			return
+		if self.debug:
+			print(text)
+			return
 		for i in range(0, len(text)):
 			print(text[i], end='', flush=True)
 			time.sleep(0.1)
@@ -125,9 +132,10 @@ class Game():
 			word_id = self.__word_id(n[0][0])
 			self.state = str(word_id) + str(n[0][2]) + str(n[0][3]) + str(self.location)
 
-		print('\033[96m' + json.dumps(v) + '\033[0m')
-		print('\033[96m' + json.dumps(n) + '\033[0m')
-		print('\033[96m' + self.state + '\033[0m')
+		if self.debug:
+			print('\033[96m' + json.dumps(v) + '\033[0m')
+			print('\033[96m' + json.dumps(n) + '\033[0m')
+			print('\033[96m' + self.state + '\033[0m')
 
 		self.time_remaining = self.time_remaining - 1
 		self.strength = self.__s()
@@ -184,6 +192,44 @@ class Game():
 			self.over = True
 
 		return
+
+	def observation(self):
+		"""Return a structured observation for agents."""
+		inventory = []
+		for i, item in enumerate(self.items):
+			if item[2] == 0:
+				inventory.append({
+					"id": i + 1,
+					"code": item[0],
+					"name": item[1],
+					"status": item[3]
+				})
+
+		visible_items = []
+		for i, item in enumerate(self.items):
+			if item[2] == self.location and item[3] < 1:
+				visible_items.append({
+					"id": i + 1,
+					"code": item[0],
+					"name": item[1],
+					"status": item[3]
+				})
+
+		return {
+			"location": self.location,
+			"time_remaining": self.time_remaining,
+			"strength": self.strength,
+			"wisdom": self.wisdom,
+			"food": self.food,
+			"drink": self.drink,
+			"items_held": self.items_held,
+			"status": self.status,
+			"state": self.state,
+			"over": self.over,
+			"inventory": inventory,
+			"visible_items": visible_items
+		}
+
 
 	def __logmen(self):
 		
@@ -244,7 +290,7 @@ class Game():
 			self.status = "YOU GOT LOST AND DROWNED"
 			self.over = True
 			return
-		if self.strength < 15:
+		if self.strength < 15 and not self.quiet:
 			print("YOU ARE VERY WEAK")
 		self.status = "YOU SURFACE"
 		self.location = 30 + random.randint(1, 3)
@@ -817,6 +863,94 @@ class Game():
 		print('='*60 + '\n')
 		self.status = 'DEBUG INFO DISPLAYED'
 		return
+
+
+class IOSEnv:
+	"""Programmatic environment wrapper for RL training."""
+
+	ACTIONS = [
+		"N", "S", "E", "W",
+		"GO NORTH", "GO SOUTH", "GO EAST", "GO WEST",
+		"GET", "DROP", "OPEN", "EAT", "DRINK", "GIVE", "SAY", "RUB", "RIDE", "WAVE", "HELP", "SCRATCH"
+	]
+
+	def __init__(self, debug=False, quiet=True):
+		self.debug = debug
+		self.quiet = quiet
+		self.game = None
+		self.reset()
+
+	def _reward(self, prev_obs, obs):
+		"""Simple shaping reward to support early exploration."""
+		if obs["over"]:
+			if obs["status"] == "YOUR QUEST IS OVER":
+				return 1000.0
+			return -100.0
+
+		reward = -0.1
+		reward += (obs["wisdom"] - prev_obs["wisdom"]) * 0.2
+		reward += (obs["strength"] - prev_obs["strength"]) * 0.05
+
+		if obs["location"] != prev_obs["location"]:
+			reward += 1.0
+		if obs["items_held"] > prev_obs["items_held"]:
+			reward += 2.0
+		elif obs["items_held"] < prev_obs["items_held"]:
+			reward -= 0.2
+
+		return reward
+
+	def action_space(self):
+		"""Return fixed action templates and dynamic object-aware actions."""
+		obs = self.game.observation()
+		dynamic = []
+		for item in obs["visible_items"]:
+			name = item["code"]
+			dynamic.extend([
+				f"GET {name}",
+				f"OPEN {name}",
+				f"EAT {name}",
+				f"DRINK {name}",
+				f"RUB {name}",
+				f"TAP {name}",
+				f"HIT {name}",
+				f"ATTACK {name}"
+			])
+		for item in obs["inventory"]:
+			name = item["code"]
+			dynamic.extend([
+				f"DROP {name}",
+				f"GIVE {name}",
+				f"WAVE {name}"
+			])
+		return self.ACTIONS + sorted(set(dynamic))
+
+	def reset(self, seed=None):
+		if seed is not None:
+			random.seed(seed)
+		self.game = Game()
+		self.game.debug = self.debug
+		self.game.quiet = self.quiet
+		obs = self.game.observation()
+		info = {"text": "\n".join(self.game.prose())}
+		return obs, info
+
+	def step(self, action):
+		if self.game.over:
+			obs = self.game.observation()
+			return obs, 0.0, True, {"status": "Episode already done."}
+
+		action = (action or "").strip().upper()
+		prev_obs = self.game.observation()
+		self.game.input(action)
+		obs = self.game.observation()
+		reward = self._reward(prev_obs, obs)
+		done = obs["over"]
+		info = {"status": obs["status"], "text": "\n".join(self.game.prose())}
+		return obs, reward, done, info
+
+	def render(self):
+		return "\n".join(self.game.prose())
 
 if __name__ == "__main__":
 
