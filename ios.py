@@ -194,9 +194,16 @@ class Game():
 		return
 
 	def observation(self):
-		"""Return a structured observation for agents."""
+		"""Return a structured observation for agents.
+
+		Only the first CONST_C4 items are real game objects; remaining
+		entries are parser pseudo-items (direction words).
+		"""
 		inventory = []
-		for i, item in enumerate(self.items):
+		for i in range(self.CONST_C4):
+			item = self.items[i]
+			if not isinstance(item, list):
+				continue
 			if item[2] == 0:
 				inventory.append({
 					"id": i + 1,
@@ -206,7 +213,10 @@ class Game():
 				})
 
 		visible_items = []
-		for i, item in enumerate(self.items):
+		for i in range(self.CONST_C4):
+			item = self.items[i]
+			if not isinstance(item, list):
+				continue
 			if item[2] == self.location and item[3] < 1:
 				visible_items.append({
 					"id": i + 1,
@@ -449,7 +459,7 @@ class Game():
 			self.items[o - 1][2] = 0
 
 		if ((o == 16) & (self.items[9][2] != 0)):
-			self.items[o - 1] = self.location
+			self.items[o - 1][2] = self.location
 			self.status = "IT ESCAPED."
 			verbs = ['']
 
@@ -874,29 +884,74 @@ class IOSEnv:
 		"GET", "DROP", "OPEN", "EAT", "DRINK", "GIVE", "SAY", "RUB", "RIDE", "WAVE", "HELP", "SCRATCH"
 	]
 
+	# Status-string markers that indicate a command did nothing useful.
+	_FAIL_MARKERS = (
+		"CAN'T", "DON'T HAVE", "UNRECOGNISED", "NOT HERE",
+		"NO FOOD", "NO DRINK", "WHAT ITEM", "WILL NOT LET",
+		"TOO STEEP", "BARRED", "HOLD YOU", "REFUSED",
+		"ROCKS MOVE", "HISSSS",
+	)
+
 	def __init__(self, debug=False, quiet=True):
 		self.debug = debug
 		self.quiet = quiet
 		self.game = None
+		self._visited_locations = set()
+		self._ever_carried = set()
+		self._last_command = None
+		self._repeat_count = 0
 		self.reset()
 
-	def _reward(self, prev_obs, obs):
-		"""Simple shaping reward to support early exploration."""
+	def _reward(self, prev_obs, obs, command):
+		"""Progress-based reward shaping.
+
+		Rewards are sparse and tied to genuine progress:
+		  * first-time location visit
+		  * first-time item acquisition
+		  * wisdom gain (reflects subgoal completion)
+		  * terminal win
+		Penalties discourage no-op commands and blind repetition.
+		Strength gains are NOT rewarded (prevents EAT/DRINK farming).
+		"""
 		if obs["over"]:
 			if obs["status"] == "YOUR QUEST IS OVER":
 				return 1000.0
-			return -100.0
+			return -50.0
 
-		reward = -0.1
-		reward += (obs["wisdom"] - prev_obs["wisdom"]) * 0.2
-		reward += (obs["strength"] - prev_obs["strength"]) * 0.05
+		reward = -0.05  # small step cost
 
-		if obs["location"] != prev_obs["location"]:
-			reward += 1.0
-		if obs["items_held"] > prev_obs["items_held"]:
-			reward += 2.0
-		elif obs["items_held"] < prev_obs["items_held"]:
-			reward -= 0.2
+		# First-time location visit.
+		loc = obs["location"]
+		if loc not in self._visited_locations:
+			self._visited_locations.add(loc)
+			reward += 3.0
+
+		# First-time item acquisition.
+		carried_now = {item["id"] for item in obs["inventory"]}
+		newly_acquired = carried_now - self._ever_carried
+		if newly_acquired:
+			reward += 5.0 * len(newly_acquired)
+			self._ever_carried.update(newly_acquired)
+
+		# Wisdom gain (reflects successful subgoal interactions).
+		dw = obs["wisdom"] - prev_obs["wisdom"]
+		if dw > 0:
+			reward += dw * 0.3
+		elif dw < 0:
+			reward += dw * 0.1  # small penalty for wisdom loss
+
+		# Penalize known failure/no-op status messages.
+		status = (obs["status"] or "").upper()
+		if any(marker in status for marker in self._FAIL_MARKERS):
+			reward -= 0.5
+
+		# Penalize repeating the exact same command.
+		if command == self._last_command:
+			self._repeat_count += 1
+			reward -= 0.1 * min(self._repeat_count, 5)
+		else:
+			self._repeat_count = 0
+		self._last_command = command
 
 		return reward
 
@@ -931,6 +986,10 @@ class IOSEnv:
 		self.game = Game()
 		self.game.debug = self.debug
 		self.game.quiet = self.quiet
+		self._visited_locations = {self.game.location}
+		self._ever_carried = set()
+		self._last_command = None
+		self._repeat_count = 0
 		obs = self.game.observation()
 		info = {"text": "\n".join(self.game.prose())}
 		return obs, info
@@ -944,7 +1003,7 @@ class IOSEnv:
 		prev_obs = self.game.observation()
 		self.game.input(action)
 		obs = self.game.observation()
-		reward = self._reward(prev_obs, obs)
+		reward = self._reward(prev_obs, obs, action)
 		done = obs["over"]
 		info = {"status": obs["status"], "text": "\n".join(self.game.prose())}
 		return obs, reward, done, info
